@@ -3,6 +3,8 @@ use egui_wgpu::ScreenDescriptor;
 use egui_winit::State as EguiWinitState;
 use std::iter;
 use tokio::sync::mpsc;
+use tokio::process::Command;
+use tokio::io::{AsyncBufReadExt, BufReader};
 use winit::{
     event::{Event, WindowEvent},
     event_loop::{EventLoopBuilder, EventLoopProxy},
@@ -282,25 +284,28 @@ async fn new(window: &'window Window, _event_loop_proxy: EventLoopProxy<AppMessa
                                 // Echo the command to the main buffer
                                 let _ = sender.try_send(AppMessage::NewLine(format!("> {}", command)));
                                 
-                                // Parse and execute the command
+                                // NEW: Execute the command as a shell process
                                 if command == "run_task" {
-                                    // Clone the sender to move into the async task
+                                    // Keep the demo task for backward compatibility
                                     let task_sender = sender.clone();
-                                    
-                                    // Spawn the background task
                                     tokio::spawn(async move {
-                                        // Send initial status
                                         let _ = task_sender.try_send(AppMessage::NewLine("[INFO] Starting background task...".to_string()));
-                                        
-                                        // Simulate some work with a 2-second delay
                                         tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-                                        
-                                        // Send completion message
                                         let _ = task_sender.try_send(AppMessage::TaskCompleted("Background task executed successfully".to_string()));
                                     });
-                                } else if !command.is_empty() {
-                                    // Handle other commands
-                                    let _ = sender.try_send(AppMessage::NewLine(format!("[ERROR] Unknown command: {}", command)));
+                                } else if command == "clear" {
+                                    // Handle clear command by reinitializing text buffer
+                                    // This is a UI-only operation, so we handle it differently
+                                    text_buffer.lines.clear();
+                                    text_buffer.add_line("Terminal cleared.".into());
+                                } else {
+                                    // NEW: Execute any other command as a shell process
+                                    let task_sender = sender.clone();
+                                    let cmd = command.clone();
+                                    
+                                    tokio::spawn(async move {
+                                        execute_shell_command(cmd, task_sender).await;
+                                    });
                                 }
                             }
                             
@@ -373,6 +378,78 @@ async fn new(window: &'window Window, _event_loop_proxy: EventLoopProxy<AppMessa
         Ok(())
     }
 }
+
+// NEW: Function to execute shell commands
+async fn execute_shell_command(command: String, sender: mpsc::Sender<AppMessage>) {
+    let result = if cfg!(target_os = "windows") {
+        Command::new("cmd")
+            .args(["/C", &command])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+    } else {
+        // On macOS/Linux, use shell to handle complex commands
+        Command::new("sh")
+            .args(["-c", &command])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+    };
+
+    let mut child = match result {
+        Ok(child) => child,
+        Err(e) => {
+            let _ = sender.send(AppMessage::NewLine(format!("[ERROR] Failed to execute command: {}", e))).await;
+            return;
+        }
+    };
+
+    let stdout = child.stdout.take().expect("Failed to open stdout");
+    let stderr = child.stderr.take().expect("Failed to open stderr");
+    
+    let stdout_reader = BufReader::new(stdout);
+    let stderr_reader = BufReader::new(stderr);
+    
+    let sender_clone = sender.clone();
+    
+    // Spawn tasks to read stdout and stderr concurrently
+    let stdout_task = tokio::spawn({
+        let sender = sender_clone.clone();
+        async move {
+            let mut lines = stdout_reader.lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let _ = sender.send(AppMessage::NewLine(line)).await;
+            }
+        }
+    });
+    
+    let stderr_task = tokio::spawn({
+        let sender = sender_clone;
+        async move {
+            let mut lines = stderr_reader.lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let _ = sender.send(AppMessage::NewLine(format!("[ERROR] {}", line))).await;
+            }
+        }
+    });
+    
+    // Wait for both tasks and the process to complete
+    let (_, _, exit_status) = tokio::join!(stdout_task, stderr_task, child.wait());
+    
+    match exit_status {
+        Ok(status) => {
+            if status.success() {
+                let _ = sender.send(AppMessage::NewLine("[INFO] Command completed successfully".to_string())).await;
+            } else {
+                let _ = sender.send(AppMessage::NewLine(format!("[ERROR] Command failed with exit code: {}", status.code().unwrap_or(-1)))).await;
+            }
+        }
+        Err(e) => {
+            let _ = sender.send(AppMessage::NewLine(format!("[ERROR] Failed to wait for command: {}", e))).await;
+        }
+    }
+}
+
 
 // NEW: Tag the main function with tokio's macro to set up the runtime
 #[tokio::main]
