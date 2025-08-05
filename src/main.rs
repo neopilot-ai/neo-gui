@@ -115,6 +115,10 @@ struct AppState<'window> {
     text_buffer: TextBuffer,
     // NEW: A string to hold the user's current input
     input_buffer: String,
+    // NEW: Command history functionality
+    command_history: Vec<String>,
+    history_index: Option<usize>, // None means we're at the "current" position
+    current_input: String, // Store the current input when navigating history
 }
 
 impl<'window> AppState<'window> {
@@ -207,6 +211,10 @@ async fn new(window: &'window Window, _event_loop_proxy: EventLoopProxy<AppMessa
             text_buffer,
             // NEW: Initialize the input buffer
             input_buffer: String::new(),
+            // NEW: Initialize command history
+            command_history: Vec::new(),
+            history_index: None,
+            current_input: String::new(),
         }
     }
 
@@ -276,14 +284,44 @@ async fn new(window: &'window Window, _event_loop_proxy: EventLoopProxy<AppMessa
                                 .lock_focus(true) // Keep focus on the input field
                         );
 
-                        // 2. Check if the user pressed Enter
-                        if response.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
-                            // 3. Send the command to be processed
+                        // Handle command history navigation
+                        if ui.input(|i| i.key_pressed(Key::ArrowUp)) {
+                            if let Some(history_index) = self.history_index {
+                                if history_index > 0 {
+                                    self.history_index = Some(history_index - 1);
+                                }
+                            } else {
+                                if !self.command_history.is_empty() {
+                                    self.history_index = Some(self.command_history.len() - 1);
+                                    self.current_input = self.input_buffer.clone();
+                                }
+                            }
+                            if let Some(index) = self.history_index {
+                                self.input_buffer = self.command_history.get(index).cloned().unwrap_or_default();
+                            }
+                        } else if ui.input(|i| i.key_pressed(Key::ArrowDown)) {
+                            if let Some(history_index) = self.history_index {
+                                if history_index + 1 < self.command_history.len() {
+                                    self.history_index = Some(history_index + 1);
+                                    self.input_buffer = self.command_history.get(history_index + 1).cloned().unwrap_or_default();
+                                } else {
+                                    self.history_index = None;
+                                    self.input_buffer = self.current_input.clone();
+                                }
+                            }
+                        } else if response.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                            // Reset history tracking on new command
+                            self.history_index = None;
+                            self.current_input.clear();
+
+                            // Send the command to be processed
                             let command = self.input_buffer.trim().to_string();
                             if !command.is_empty() {
                                 // Echo the command to the main buffer
                                 let _ = sender.try_send(AppMessage::NewLine(format!("> {}", command)));
-                                
+                                // Add to history
+                                self.command_history.push(command.clone());
+
                                 // NEW: Execute the command as a shell process
                                 if command == "run_task" {
                                     // Keep the demo task for backward compatibility
@@ -302,17 +340,16 @@ async fn new(window: &'window Window, _event_loop_proxy: EventLoopProxy<AppMessa
                                     // NEW: Execute any other command as a shell process
                                     let task_sender = sender.clone();
                                     let cmd = command.clone();
-                                    
                                     tokio::spawn(async move {
                                         execute_shell_command(cmd, task_sender).await;
                                     });
                                 }
                             }
-                            
-                            // 4. Clear the input buffer for the next command
+
+                            // Clear the input buffer for the next command
                             self.input_buffer.clear();
-                            
-                            // 5. Regain focus for the next command
+
+                            // Regain focus for the next command
                             response.request_focus();
                         }
                     });
