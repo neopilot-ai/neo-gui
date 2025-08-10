@@ -1,539 +1,308 @@
-use egui::Key;
-use egui_wgpu::ScreenDescriptor;
-use egui_winit::State as EguiWinitState;
-use std::iter;
+// src/main.rs
+
+use egui::{
+    epaint::FontId, style::Spacing, Color32, Context, FontFamily, Rounding, ScrollArea, Stroke,
+    Style, TextStyle, Vec2, Visuals,
+};
+use egui_wgpu::{Renderer, ScreenDescriptor};
+use egui_winit::State;
+use egui::ViewportId;
+use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc;
-use tokio::process::Command;
-use tokio::io::{AsyncBufReadExt, BufReader};
 use winit::{
     event::{Event, WindowEvent},
-    event_loop::{EventLoopBuilder, EventLoopProxy},
+    event_loop::{ControlFlow, EventLoop},
     window::Window,
 };
 
-// NEW: Define messages that can be sent from background tasks to the UI
+/// Message enum for communication between async tasks and the UI thread.
 #[derive(Debug)]
 enum AppMessage {
-    // NEW: A message to add a new line to our text buffer
-    NewLine(String),
-    // A message to indicate a task has completed with a result
     TaskCompleted(String),
+    NewLine(String),
 }
 
-// NEW: A function to create our custom "Hacker Theme".
-// This returns a complete egui::Style object.
-fn create_hacker_theme() -> egui::Style {
-    let mut style = egui::Style::default();
-
-    // Use egui's built-in dark theme as a base.
-    style.visuals = egui::Visuals::dark();
-
-    // Define our custom colors
-    let hacker_green = egui::Color32::from_rgb(0, 255, 68); // A bright, vibrant green
-    let background_dark = egui::Color32::from_rgb(10, 10, 10); // A very dark gray
-    let mid_gray = egui::Color32::from_rgb(60, 60, 60);
-    let light_gray = egui::Color32::from_rgb(100, 100, 100);
-
-    // --- Global Visuals ---
-    style.visuals.window_fill = background_dark;
-    style.visuals.panel_fill = background_dark;
-    style.visuals.window_stroke = egui::Stroke::new(1.0, mid_gray);
-    style.visuals.selection.bg_fill = hacker_green.linear_multiply(0.3); // Selection background
-    style.visuals.selection.stroke = egui::Stroke::NONE;
-
-    // --- Widget Visuals ---
-    let widgets = &mut style.visuals.widgets;
-    widgets.noninteractive.bg_fill = background_dark;
-    widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, light_gray); // Default text color
-
-    // Interactive widgets (buttons, text boxes)
-    widgets.inactive.bg_fill = mid_gray.linear_multiply(0.5);
-    widgets.inactive.fg_stroke = egui::Stroke::new(1.0, hacker_green);
-    
-    widgets.hovered.bg_fill = mid_gray;
-    widgets.hovered.fg_stroke = egui::Stroke::new(1.5, hacker_green); // Make text bold on hover
-    
-    widgets.active.bg_fill = light_gray;
-    widgets.active.fg_stroke = egui::Stroke::new(2.0, hacker_green);
-
-    // --- Headings and special text ---
-    style.text_styles.insert(
-        egui::TextStyle::Heading,
-        egui::FontId::new(24.0, egui::FontFamily::Monospace),
-    );
-    style.text_styles.insert(
-        egui::TextStyle::Body,
-        egui::FontId::new(16.0, egui::FontFamily::Monospace),
-    );
-    style.text_styles.insert(
-        egui::TextStyle::Button,
-        egui::FontId::new(16.0, egui::FontFamily::Monospace),
-    );
-    
-    style
-}
-
-// NEW: A struct to manage our text buffer state
+/// Manages the terminal's text content.
 struct TextBuffer {
     lines: Vec<String>,
-    // A simple way to limit memory usage
     max_lines: usize,
 }
 
 impl TextBuffer {
     fn new(max_lines: usize) -> Self {
         Self {
-            lines: Vec::new(),
+            lines: Vec::with_capacity(max_lines),
             max_lines,
         }
     }
 
     fn add_line(&mut self, line: String) {
-        self.lines.push(line);
-        if self.lines.len() > self.max_lines {
-            // Remove old lines to prevent infinite memory growth
+        if self.lines.len() >= self.max_lines {
             self.lines.remove(0);
         }
+        self.lines.push(line);
     }
 }
 
-struct AppState<'window> {
-    surface: wgpu::Surface<'window>,
-    device: wgpu::Device,
-    queue: wgpu::Queue,
-    config: wgpu::SurfaceConfiguration,
-    size: winit::dpi::PhysicalSize<u32>,
-    window: &'window Window,
-    egui_ctx: egui::Context,
-    egui_state: EguiWinitState,
-    egui_renderer: egui_wgpu::Renderer,
-    frame_count: usize,
-    sender: mpsc::Sender<AppMessage>,
-    receiver: mpsc::Receiver<AppMessage>,
-    
-    // NEW: Add the text buffer to our application state
+/// Holds the entire application state.
+struct AppState {
     text_buffer: TextBuffer,
-    // NEW: A string to hold the user's current input
-    input_buffer: String,
-    // NEW: Command history functionality
-    command_history: Vec<String>,
-    history_index: Option<usize>, // None means we're at the "current" position
-    current_input: String, // Store the current input when navigating history
+    status_message: String,
+    message_receiver: mpsc::Receiver<AppMessage>,
 }
 
-impl<'window> AppState<'window> {
-async fn new(window: &'window Window, _event_loop_proxy: EventLoopProxy<AppMessage>) -> Self {
-        let size = window.inner_size();
+/// Creates the "Hacker Theme" as specified in THEMING_SYSTEM.md.
+fn create_hacker_theme() -> Style {
+    let hacker_green = Color32::from_rgb(0, 255, 68);
+    let background_dark = Color32::from_rgb(10, 10, 10);
+    let mid_gray = Color32::from_rgb(60, 60, 60);
+    let light_gray = Color32::from_rgb(100, 100, 100);
 
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::all(),
-            ..Default::default()
-        });
+    let mut style = Style::default();
 
-        let surface = instance.create_surface(window).unwrap();
-
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                compatible_surface: Some(&surface),
-                force_fallback_adapter: false,
-            })
-            .await
-            .unwrap();
-
-        let (device, queue) = adapter
-            .request_device(
-                &wgpu::DeviceDescriptor {
-                    label: Some("Main Device"),
-                    required_features: wgpu::Features::empty(),
-                    required_limits: wgpu::Limits::default(),
-                },
-                None, // Trace path
-            )
-            .await
-            .unwrap();
-
-        let surface_caps = surface.get_capabilities(&adapter);
-        let surface_format = surface_caps
-            .formats
-            .iter()
-            .copied()
-            .find(|f| f.is_srgb())
-            .unwrap_or(surface_caps.formats[0]);
-        
-        let config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format: surface_format,
-            width: size.width,
-            height: size.height,
-            present_mode: surface_caps.present_modes[0], // Vsync
-            alpha_mode: surface_caps.alpha_modes[0],
-            view_formats: vec![],
-            desired_maximum_frame_latency: 2,
-        };
-        surface.configure(&device, &config);
-
-        let egui_ctx = egui::Context::default();
-        
-        // MODIFIED: Apply our custom theme right after creating the context.
-        egui_ctx.set_style(create_hacker_theme());
-
-        let egui_state = EguiWinitState::new(
-            egui_ctx.clone(),
-            egui::ViewportId::default(),
-            &window,
-            None,
-            None
-        );
-        let egui_renderer = egui_wgpu::Renderer::new(&device, config.format, None, 1);
-
-        // NEW: Create the channel for async communication
-        let (sender, receiver) = mpsc::channel(100); // Increased channel buffer size
-
-        // NEW: Initialize the text buffer
-        let mut text_buffer = TextBuffer::new(1000); // Keep up to 1000 lines of history
-        text_buffer.add_line("SYSTEM BOOT COMPLETE.".into());
-        text_buffer.add_line("Awaiting command...".into());
-
-        Self {
-            window,
-            surface,
-            device,
-            queue,
-            config,
-            size,
-            egui_ctx,
-            egui_state,
-            egui_renderer,
-            frame_count: 0,
-            sender,
-            receiver,
-            text_buffer,
-            // NEW: Initialize the input buffer
-            input_buffer: String::new(),
-            // NEW: Initialize command history
-            command_history: Vec::new(),
-            history_index: None,
-            current_input: String::new(),
-        }
-    }
-
-    pub fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
-        if new_size.width > 0 && new_size.height > 0 {
-            self.size = new_size;
-            self.config.width = new_size.width;
-            self.config.height = new_size.height;
-            self.surface.configure(&self.device, &self.config);
-        }
-    }
-
-    pub fn handle_event(&mut self, event: &WindowEvent) -> bool {
-        self.egui_state.on_window_event(self.window, event).consumed
-    }
-
-
-    // MODIFIED: Handle the new message type
-    pub fn handle_message(&mut self, message: AppMessage) {
-        match message {
-            AppMessage::TaskCompleted(result) => {
-                self.text_buffer.add_line(format!("[OK] Task finished: {}", result));
-            }
-            AppMessage::NewLine(line) => {
-                self.text_buffer.add_line(line);
-            }
-        }
-    }
-
-    pub fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
-        // NEW: Poll the receiver for messages from our tasks without blocking.
-        // If a message is ready, we immediately process it.
-        while let Ok(message) = self.receiver.try_recv() {
-            self.handle_message(message);
-        }
-        let output_frame = self.surface.get_current_texture()?;
-        let view = output_frame
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
-
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("Render Encoder"),
-        });
-
-        let raw_input = self.egui_state.take_egui_input(&self.window);
-        
-        // Clone the sender so we can move it into the UI closure
-        let sender = self.sender.clone();
-
-        // Pass a mutable reference to the text buffer into the UI closure
-        let text_buffer = &mut self.text_buffer;
-        
-        let full_output = self.egui_ctx.run(raw_input, |ctx| {
-            // We'll use a TopBottomPanel to dock the input field to the bottom.
-            egui::TopBottomPanel::bottom("input_panel")
-                .resizable(false)
-                .min_height(30.0)
-                .show(ctx, |ui| {
-                    // This is the core implementation of the prompt.
-                    ui.horizontal(|ui| {
-                        ui.label(">");
-                        
-                        // 1. Create the TextEdit widget
-                        let response = ui.add(
-                            egui::TextEdit::singleline(&mut self.input_buffer)
-                                .desired_width(f32::INFINITY) // Take up all available horizontal space
-                                .lock_focus(true) // Keep focus on the input field
-                        );
-
-                        // Handle command history navigation
-                        if ui.input(|i| i.key_pressed(Key::ArrowUp)) {
-                            if let Some(history_index) = self.history_index {
-                                if history_index > 0 {
-                                    self.history_index = Some(history_index - 1);
-                                }
-                            } else {
-                                if !self.command_history.is_empty() {
-                                    self.history_index = Some(self.command_history.len() - 1);
-                                    self.current_input = self.input_buffer.clone();
-                                }
-                            }
-                            if let Some(index) = self.history_index {
-                                self.input_buffer = self.command_history.get(index).cloned().unwrap_or_default();
-                            }
-                        } else if ui.input(|i| i.key_pressed(Key::ArrowDown)) {
-                            if let Some(history_index) = self.history_index {
-                                if history_index + 1 < self.command_history.len() {
-                                    self.history_index = Some(history_index + 1);
-                                    self.input_buffer = self.command_history.get(history_index + 1).cloned().unwrap_or_default();
-                                } else {
-                                    self.history_index = None;
-                                    self.input_buffer = self.current_input.clone();
-                                }
-                            }
-                        } else if response.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
-                            // Reset history tracking on new command
-                            self.history_index = None;
-                            self.current_input.clear();
-
-                            // Send the command to be processed
-                            let command = self.input_buffer.trim().to_string();
-                            if !command.is_empty() {
-                                // Echo the command to the main buffer
-                                let _ = sender.try_send(AppMessage::NewLine(format!("> {}", command)));
-                                // Add to history
-                                self.command_history.push(command.clone());
-
-                                // NEW: Execute the command as a shell process
-                                if command == "run_task" {
-                                    // Keep the demo task for backward compatibility
-                                    let task_sender = sender.clone();
-                                    tokio::spawn(async move {
-                                        let _ = task_sender.try_send(AppMessage::NewLine("[INFO] Starting background task...".to_string()));
-                                        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-                                        let _ = task_sender.try_send(AppMessage::TaskCompleted("Background task executed successfully".to_string()));
-                                    });
-                                } else if command == "clear" {
-                                    // Handle clear command by reinitializing text buffer
-                                    // This is a UI-only operation, so we handle it differently
-                                    text_buffer.lines.clear();
-                                    text_buffer.add_line("Terminal cleared.".into());
-                                } else {
-                                    // NEW: Execute any other command as a shell process
-                                    let task_sender = sender.clone();
-                                    let cmd = command.clone();
-                                    tokio::spawn(async move {
-                                        execute_shell_command(cmd, task_sender).await;
-                                    });
-                                }
-                            }
-
-                            // Clear the input buffer for the next command
-                            self.input_buffer.clear();
-
-                            // Regain focus for the next command
-                            response.request_focus();
-                        }
-                    });
-                });
-            
-            // The central panel now contains our scrollable text buffer
-            egui::CentralPanel::default().show(ctx, |ui| {
-                ui.heading("SYSTEM CONSOLE");
-                
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .stick_to_bottom(true)
-                    .show(ui, |ui| {
-                        for line in &text_buffer.lines {
-                            ui.label(line);
-                        }
-                    });
-            });
-        });
-        
-        self.frame_count += 1;
-        self.egui_state.handle_platform_output(self.window, full_output.platform_output);
-        let tris = self.egui_ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
-
-        let screen_descriptor = ScreenDescriptor {
-            size_in_pixels: [self.config.width, self.config.height],
-            pixels_per_point: self.window.scale_factor() as f32,
-        };
-
-        for (id, image_delta) in &full_output.textures_delta.set {
-            self.egui_renderer.update_texture(&self.device, &self.queue, *id, image_delta);
-        }
-        self.egui_renderer.update_buffers(&self.device, &self.queue, &mut encoder, &tris, &screen_descriptor);
-
-        {
-            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Egui Render Pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        // MODIFIED: Change the wgpu clear color to match our theme's background
-                        load: wgpu::LoadOp::Clear(wgpu::Color { r: 10.0/255.0, g: 10.0/255.0, b: 10.0/255.0, a: 1.0 }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
-
-            self.egui_renderer.render(&mut render_pass, &tris, &screen_descriptor);
-        }
-
-        for id in &full_output.textures_delta.free {
-            self.egui_renderer.free_texture(id);
-        }
-
-        self.queue.submit(iter::once(encoder.finish()));
-        
-        output_frame.present();
-
-        Ok(())
-    }
-}
-
-// NEW: Function to execute shell commands
-async fn execute_shell_command(command: String, sender: mpsc::Sender<AppMessage>) {
-    let result = if cfg!(target_os = "windows") {
-        Command::new("cmd")
-            .args(["/C", &command])
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-    } else {
-        // On macOS/Linux, use shell to handle complex commands
-        Command::new("sh")
-            .args(["-c", &command])
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
+    style.visuals = Visuals {
+        dark_mode: true,
+        override_text_color: Some(hacker_green),
+        panel_fill: background_dark,
+        window_rounding: Rounding::ZERO,
+        window_stroke: Stroke::new(1.0, mid_gray),
+        selection: egui::style::Selection {
+            bg_fill: Color32::from_rgba_premultiplied(
+                hacker_green.r(),
+                hacker_green.g(),
+                hacker_green.b(),
+                50,
+            ),
+            stroke: Stroke::new(1.0, hacker_green),
+        },
+        ..Visuals::dark()
     };
 
-    let mut child = match result {
-        Ok(child) => child,
-        Err(e) => {
-            let _ = sender.send(AppMessage::NewLine(format!("[ERROR] Failed to execute command: {}", e))).await;
-            return;
-        }
+    style.spacing = Spacing {
+        item_spacing: Vec2::new(8.0, 8.0),
+        ..Spacing::default()
     };
 
-    let stdout = child.stdout.take().expect("Failed to open stdout");
-    let stderr = child.stderr.take().expect("Failed to open stderr");
-    
-    let stdout_reader = BufReader::new(stdout);
-    let stderr_reader = BufReader::new(stderr);
-    
-    let sender_clone = sender.clone();
-    
-    // Spawn tasks to read stdout and stderr concurrently
-    let stdout_task = tokio::spawn({
-        let sender = sender_clone.clone();
-        async move {
-            let mut lines = stdout_reader.lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                let _ = sender.send(AppMessage::NewLine(line)).await;
-            }
-        }
-    });
-    
-    let stderr_task = tokio::spawn({
-        let sender = sender_clone;
-        async move {
-            let mut lines = stderr_reader.lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                let _ = sender.send(AppMessage::NewLine(format!("[ERROR] {}", line))).await;
-            }
-        }
-    });
-    
-    // Wait for both tasks and the process to complete
-    let (_, _, exit_status) = tokio::join!(stdout_task, stderr_task, child.wait());
-    
-    match exit_status {
-        Ok(status) => {
-            if status.success() {
-                let _ = sender.send(AppMessage::NewLine("[INFO] Command completed successfully".to_string())).await;
-            } else {
-                let _ = sender.send(AppMessage::NewLine(format!("[ERROR] Command failed with exit code: {}", status.code().unwrap_or(-1)))).await;
-            }
-        }
-        Err(e) => {
-            let _ = sender.send(AppMessage::NewLine(format!("[ERROR] Failed to wait for command: {}", e))).await;
-        }
-    }
+    style.text_styles = [
+        (
+            TextStyle::Heading,
+            FontId::new(24.0, FontFamily::Monospace),
+        ),
+        (TextStyle::Body, FontId::new(16.0, FontFamily::Monospace)),
+        (TextStyle::Button, FontId::new(16.0, FontFamily::Monospace)),
+        (
+            TextStyle::Monospace,
+            FontId::new(16.0, FontFamily::Monospace),
+        ),
+        (TextStyle::Small, FontId::new(12.0, FontFamily::Monospace)),
+    ]
+    .into();
+
+    let widget_visuals = &mut style.visuals.widgets;
+    widget_visuals.inactive = egui::style::WidgetVisuals {
+        bg_fill: mid_gray,
+        fg_stroke: Stroke::new(1.0, hacker_green),
+        rounding: Rounding::ZERO,
+        bg_stroke: Stroke::new(1.0, hacker_green),
+        ..widget_visuals.inactive
+    };
+    widget_visuals.hovered = egui::style::WidgetVisuals {
+        bg_fill: light_gray,
+        fg_stroke: Stroke::new(2.0, hacker_green),
+        bg_stroke: Stroke::new(1.0, hacker_green),
+        ..widget_visuals.hovered
+    };
+    widget_visuals.active = egui::style::WidgetVisuals {
+        bg_fill: background_dark,
+        fg_stroke: Stroke::new(2.0, hacker_green),
+        bg_stroke: Stroke::new(2.0, hacker_green),
+        ..widget_visuals.active
+    };
+
+    style
 }
 
-
-// NEW: Tag the main function with tokio's macro to set up the runtime
 #[tokio::main]
 async fn main() {
     env_logger::init();
+    let event_loop = EventLoop::new().unwrap();
+    let window = Arc::new(Window::new(&event_loop).unwrap());
+    window.set_title("Neo-Term");
 
-    // NEW: Create an event loop that can handle custom events (our AppMessage)
-    let event_loop = EventLoopBuilder::<AppMessage>::with_user_event().build().unwrap();
-    let window = Window::new(&event_loop).unwrap();
-    window.set_title("Neo-Term"); // MODIFIED: New title!
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
+    let surface = instance.create_surface(window.clone()).unwrap();
+    let adapter = instance
+        .request_adapter(&wgpu::RequestAdapterOptions::default())
+        .await
+        .unwrap();
 
-    // NEW: Create a proxy to send custom events to the event loop from other threads
-    let event_loop_proxy = event_loop.create_proxy();
+    let (device, queue) = adapter
+        .request_device(&wgpu::DeviceDescriptor::default(), None)
+        .await
+        .unwrap();
 
-    // Pass the proxy to our app state. This is not strictly needed for the mpsc channel
-    // approach but is good practice for winit user events.
-    let mut state = AppState::new(&window, event_loop_proxy).await;
+    let size = window.inner_size();
+    let surface_caps = surface.get_capabilities(&adapter);
+    let surface_format = surface_caps.formats[0];
+
+    let mut config = wgpu::SurfaceConfiguration {
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        format: surface_format,
+        width: size.width,
+        height: size.height,
+        present_mode: wgpu::PresentMode::Fifo,
+        alpha_mode: surface_caps.alpha_modes[0],
+        view_formats: vec![],
+        desired_maximum_frame_latency: 2,
+    };
+    surface.configure(&device, &config);
+
+    // FIX: API for egui-winit 0.27 takes the event loop target.
+    let egui_ctx = Context::default();
+    let mut egui_state = State::new(egui_ctx.clone(), ViewportId::ROOT, &event_loop, None, None);
+    let mut egui_renderer = Renderer::new(&device, surface_format, None, 1);
+    egui_ctx.set_style(create_hacker_theme());
+
+    let (message_sender, message_receiver) = mpsc::channel::<AppMessage>(100);
+
+    let mut app_state = AppState {
+        text_buffer: TextBuffer::new(1000),
+        status_message: "STATUS: System nominal.".to_string(),
+        message_receiver,
+    };
+    // Initialize with ASCII art
+    app_state.text_buffer.add_line("███╗   ██╗███████╗ ██████╗".into());
+    app_state.text_buffer.add_line("████╗  ██║██╔════╝██╔═══██╗".into());
+    app_state.text_buffer.add_line("██╔██╗ ██║█████╗  ██║   ██║".into());
+    app_state.text_buffer.add_line("██║╚██╗██║██╔══╝  ██║   ██║".into());
+    app_state.text_buffer.add_line("██║ ╚████║███████╗╚██████╔╝".into());
+    app_state.text_buffer.add_line("╚═╝  ╚═══╝╚══════╝ ╚═════╝ ".into());
+    app_state.text_buffer.add_line("".into());
+    app_state.text_buffer.add_line("Welcome to Neo-Term. Standby for commands.".into());
+
 
     event_loop.run(move |event, elwt| {
+        elwt.set_control_flow(ControlFlow::Poll);
+
         match event {
-            Event::WindowEvent { window_id, event } if window_id == state.window.id() => {
-                if !state.handle_event(&event) {
-                    match event {
-                        WindowEvent::CloseRequested => elwt.exit(),
-                        WindowEvent::Resized(physical_size) => state.resize(physical_size),
-                        WindowEvent::ScaleFactorChanged { .. } => state.resize(state.window.inner_size()),
-                        _ => {}
+            Event::WindowEvent { window_id, event } if window_id == window.id() => {
+                // FIX: API for egui-winit 0.27 takes the context.
+                let response = egui_state.on_window_event(&window, &event);
+                if response.consumed {
+                    return;
+                }
+                
+                match event {
+                    WindowEvent::CloseRequested => elwt.exit(),
+                    WindowEvent::Resized(new_size) => {
+                        config.width = new_size.width.max(1);
+                        config.height = new_size.height.max(1);
+                        surface.configure(&device, &config);
                     }
+                    WindowEvent::RedrawRequested => {
+                        // All drawing logic moved here.
+                        while let Ok(message) = app_state.message_receiver.try_recv() {
+                           match message {
+                                AppMessage::TaskCompleted(result) => {
+                                    app_state.status_message = format!("STATUS: {}", result);
+                                    app_state.text_buffer.add_line(format!("[ASYNC] {}", result));
+                                }
+                                AppMessage::NewLine(line) => app_state.text_buffer.add_line(line),
+                            }
+                        }
+
+                        let raw_input = egui_state.take_egui_input(&window);
+                        let output = egui_ctx.run(raw_input, |ctx| {
+                            draw_ui(ctx, &mut app_state, message_sender.clone());
+                        });
+
+                        egui_state.handle_platform_output(&window, output.platform_output);
+
+                        let screen_descriptor = ScreenDescriptor {
+                            size_in_pixels: [config.width, config.height],
+                            pixels_per_point: window.scale_factor() as f32,
+                        };
+                        let paint_jobs = egui_ctx.tessellate(output.shapes, screen_descriptor.pixels_per_point);
+
+                        let frame = surface.get_current_texture().expect("Failed to get surface texture");
+                        let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
+                        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+
+                        egui_renderer.update_buffers(&device, &queue, &mut encoder, &paint_jobs, &screen_descriptor);
+
+                        let clear_color = wgpu::Color { r: 10.0/255.0, g: 10.0/255.0, b: 10.0/255.0, a: 1.0 };
+                        {
+                            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                                label: None,
+                                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                    view: &view,
+                                    resolve_target: None,
+                                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(clear_color), store: wgpu::StoreOp::Store },
+                                })],
+                                depth_stencil_attachment: None,
+                                timestamp_writes: None,
+                                occlusion_query_set: None,
+                            });
+                            egui_renderer.render(&mut render_pass, &paint_jobs, &screen_descriptor);
+                        }
+                        queue.submit(Some(encoder.finish()));
+                        frame.present();
+                    }
+                    _ => {}
                 }
             }
             Event::AboutToWait => {
-                state.window.request_redraw();
+                window.request_redraw();
             }
-            // NEW: Handle the custom events sent from our background tasks
-            Event::UserEvent(message) => {
-                state.handle_message(message);
-            }
-            Event::WindowEvent { event: WindowEvent::RedrawRequested, .. } => {
-                match state.render() {
-                    Ok(_) => {}
-                    Err(wgpu::SurfaceError::Lost) => state.resize(state.size),
-                    Err(wgpu::SurfaceError::OutOfMemory) => elwt.exit(),
-                    Err(e) => eprintln!("{:?}", e),
-                }
-            }
-            _ => {}
+            _ => (),
         }
     }).unwrap();
 }
 
+fn draw_ui(ctx: &Context, state: &mut AppState, sender: mpsc::Sender<AppMessage>) {
+    egui::CentralPanel::default().show(ctx, |ui| {
+        ui.heading("SYSTEM CONSOLE");
+        ui.separator();
+        
+        let text_frame = egui::Frame::dark_canvas(ui.style());
+        text_frame.show(ui, |ui| {
+             ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .stick_to_bottom(true)
+                .show(ui, |ui| {
+                    ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
+                        for line in &state.text_buffer.lines {
+                            ui.label(line);
+                        }
+                    });
+                    ui.allocate_space(ui.available_size());
+                });
+        });
+        
+        ui.add_space(8.0);
+
+        ui.vertical(|ui| {
+            ui.heading("ASYNC_TASK_MODULE");
+            if ui.button("> EXECUTE_SLOW_TASK (2 seconds)").clicked() {
+                let tx = sender.clone();
+                tokio::spawn(async move {
+                    tx.send(AppMessage::NewLine("[ASYNC] Task started...".to_string())).await.ok();
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    tx.send(AppMessage::TaskCompleted("Task completed successfully.".to_string())).await.ok();
+                });
+            }
+            if ui.button("> GENERATE LOG LINE").clicked() {
+                let tx = sender.clone();
+                tokio::spawn(async move {
+                    tx.send(AppMessage::NewLine(format!("[LOG] Sample log entry at {}", chrono::Local::now().format("%H:%M:%S")))).await.ok();
+                });
+            }
+        });
+
+        ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
+            ui.separator();
+            ui.label(&state.status_message);
+        });
+    });
+}
