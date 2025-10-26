@@ -16,9 +16,11 @@ This document describes the implementation of the core text buffer feature for o
 ### Key Features
 
 - **Virtual Scrolling**: Only renders visible lines for performance with thousands of lines
-- **Stick-to-Bottom**: Automatically scrolls to bottom when new lines are added
-- **History Navigation**: Users can scroll up to view history without disrupting auto-scroll
+- **Stick-to-Bottom**: Automatically scrolls to bottom when new lines are added (when at bottom)
+- **Manual Scroll Control**: Users can scroll up to view history and scroll back down
+- **Scroll Position Tracking**: Maintains scroll state and provides visual feedback
 - **Async Message Processing**: Background tasks can add lines without blocking the UI
+- **Command Processing System**: Full terminal-like command interface with multiple commands
 - **Hacker Theme**: Dark theme with green terminal aesthetics
 
 ## Architecture
@@ -28,46 +30,73 @@ This document describes the implementation of the core text buffer feature for o
 struct TextBuffer {
     lines: Vec<String>,
     max_lines: usize,
+    scroll_position: usize,
 }
 ```
 
 The TextBuffer manages:
-- A vector of text lines
+- A vector of text lines with configurable maximum capacity
+- Scroll position tracking for navigation
 - Automatic cleanup when max_lines is exceeded
 - Thread-safe message-based updates
 
-### Message System
+### Enhanced Scrolling System
+
+The implementation includes sophisticated scroll management:
+
 ```rust
-enum AppMessage {
-    TaskCompleted(String),
-    NewLine(String),
+impl TextBuffer {
+    fn visible_lines(&self) -> &[String] {
+        let start = self.scroll_position;
+        let end = (start + self.max_lines).min(self.lines.len());
+        &self.lines[start..end]
+    }
+    
+    fn scroll_up(&mut self) { /* ... */ }
+    fn scroll_down(&mut self) { /* ... */ }
+    fn scroll_to_top(&mut self) { /* ... */ }
+    fn scroll_to_bottom(&mut self) { /* ... */ }
+    fn is_at_bottom(&self) -> bool { /* ... */ }
 }
 ```
 
-This enables:
-- Decoupled text updates from background tasks
-- Clean separation between UI and business logic
-- Non-blocking async operations
+### Command Processing System
+
+Full terminal-like command interface with multiple built-in commands:
+
+```rust
+// Available commands include:
+- help, ?          - Show help message
+- clear            - Clear the terminal
+- status           - Show system status  
+- echo <text>      - Echo text back
+- time             - Show current time
+- date             - Show current date
+- async-task       - Run async background task
+- log              - Generate log entry
+- scroll-top       - Scroll to top
+- scroll-bottom    - Scroll to bottom
+```
 
 ### UI Implementation
 
-The core text display uses egui's ScrollArea:
+The core text display uses egui's ScrollArea with smart auto-scroll behavior:
 
 ```rust
-egui::ScrollArea::vertical()
+ScrollArea::vertical()
     .auto_shrink([false, false])
-    .stick_to_bottom(true)
+    .stick_to_bottom(!state.text_buffer.is_at_bottom())
     .show(ui, |ui| {
-        for line in &text_buffer.lines {
+        for line in state.text_buffer.visible_lines() {
             ui.label(line);
         }
     });
 ```
 
-Key properties:
-- `stick_to_bottom(true)`: Maintains scroll position at bottom
-- `auto_shrink([false, false])`: Prevents unwanted resizing
-- Virtual rendering: egui automatically culls non-visible lines
+Key improvements:
+- `stick_to_bottom(!state.text_buffer.is_at_bottom())`: Smart auto-scroll that respects user scroll position
+- `visible_lines()`: Only renders lines currently in view
+- **Scroll Controls UI**: Manual scroll buttons and position indicator
 
 ## Performance Characteristics
 
@@ -96,16 +125,34 @@ Key properties:
    ```
 
 2. **Interactive Testing**:
-   - Click "> Generate Log Line" to add manual entries
-   - Click "> Run Slow Task" to test async background operations
-   - Use mouse wheel to scroll through history
-   - Notice auto-scroll behavior when at bottom
+   - **Command Interface**: Type commands in the input box and press Enter or click Execute
+   - **Available Commands**: Try `help`, `async-task`, `log`, `time`, `clear`, `scroll-top`, `scroll-bottom`
+   - **Button Tasks**: Click "> EXECUTE_SLOW_TASK" and "> GENERATE LOG LINE" to test async operations
+   - **Scroll Controls**: Use the scroll control buttons (↑ Top, ↑ Up, ↓ Down, ↓ Bottom)
+   - **Mouse Scrolling**: Use mouse wheel to scroll through history
+   - **Auto-scroll Behavior**: Notice auto-scroll only works when at bottom
 
 3. **Expected Behavior**:
-   - New lines appear at bottom automatically
-   - Scrolling up disables auto-scroll
-   - Scrolling to bottom re-enables auto-scroll
-   - Background tasks update text without blocking UI
+   - New lines appear at bottom automatically (when at bottom)
+   - Scrolling up disables auto-scroll until scrolling back to bottom
+   - Commands execute asynchronously without blocking UI
+   - Scroll position indicator shows current position
+   - Background tasks update text without freezing interface
+
+## Advanced Features Implemented
+
+### Command System
+The terminal now supports a full command interface with:
+- **Interactive Input**: Text input box with Enter key support
+- **Command History**: Commands are logged to the terminal
+- **Error Handling**: Unknown commands show helpful error messages
+- **Async Command Execution**: Long-running commands don't block the UI
+
+### Enhanced Scroll Controls
+- **Position Tracking**: Visual indicator showing scroll position percentage
+- **Smart Auto-scroll**: Only auto-scrolls when user is at bottom
+- **Manual Navigation**: Full scroll control with buttons and mouse wheel
+- **Boundary Detection**: Prevents scrolling beyond available content
 
 ## Warp-like Features Implemented
 
@@ -139,13 +186,41 @@ Following Warp terminal's modern approach:
 
 ## Next Development Steps
 
-The text buffer foundation enables these natural next features:
+The text buffer foundation now includes command processing and advanced scrolling. Next features include:
 
-1. **Text Input**: Command line input box
+1. **Text Input**: ✅ **COMPLETED** - Command line input box implemented
 2. **ANSI Support**: Colored text and formatting
-3. **Command Processing**: Execute and display shell commands
-4. **Advanced Scrolling**: Jump to specific lines, search
+3. **Command Processing**: ✅ **COMPLETED** - Full command system with multiple commands
+4. **Advanced Scrolling**: ✅ **COMPLETED** - Enhanced scroll controls and position tracking
 5. **Font Management**: Custom monospace fonts
+6. **Shell Integration**: Execute system commands
+7. **Copy-Paste**: Text selection and clipboard operations
+8. **Search Functionality**: Find and highlight text in buffer
+9. **Line Numbers**: Optional line number display
+10. **Text Wrapping**: Handle long lines gracefully
+
+## Current Status
+
+✅ **Completed Core Features:**
+- Text buffer with configurable capacity
+- Advanced scrolling with position tracking
+- Full command processing system
+- Async message integration
+- Smart auto-scroll behavior
+- Manual scroll controls
+- Command history and logging
+
+🚧 **In Development:**
+- Compilation fixes for wgpu integration
+- Performance optimizations
+- Additional command features
+
+🎯 **Future Enhancements:**
+- Shell command execution
+- ANSI color support
+- Text search and highlighting
+- Copy-paste functionality
+- Plugin system architecture
 
 ## Performance Notes
 

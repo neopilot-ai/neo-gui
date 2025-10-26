@@ -20,6 +20,7 @@ We've successfully integrated asynchronous operations into our high-performance 
 #[derive(Debug)]
 enum AppMessage {
     TaskCompleted(String),
+    NewLine(String),
 }
 ```
 
@@ -28,13 +29,25 @@ enum AppMessage {
 - Example: 2-second sleep simulation that demonstrates non-blocking operation
 - Results are sent back via channel to update UI state
 
+### 5. Command Processing System
+- **Interactive Commands**: Users can type commands in the terminal interface
+- **Async Commands**: Commands like `async-task` and `log` spawn background tasks
+- **Real-time Updates**: Command results are displayed immediately in the UI
+
 ## How It Works
 
-1. **Button Click**: User clicks "Run Slow Task (2 seconds)"
-2. **Task Spawn**: `tokio::spawn()` creates a background task
-3. **UI Remains Responsive**: Main thread continues rendering at 60fps
-4. **Non-blocking Communication**: Channel messages are polled without blocking
-5. **UI Update**: When task completes, UI updates immediately on next frame
+1. **User Input**: User types command in the terminal (e.g., "async-task")
+2. **Command Processing**: `process_command()` function handles the command
+3. **Task Spawn**: `tokio::spawn()` creates a background task for async operations
+4. **UI Remains Responsive**: Main thread continues rendering at 60fps
+5. **Non-blocking Communication**: Channel messages are polled without blocking
+6. **UI Update**: When task completes, UI updates immediately on next frame
+
+## Available Async Commands
+
+- **`async-task`**: Spawns a 1-second background task that simulates command execution
+- **`log`**: Generates a timestamped log entry via background task
+- **UI Button Tasks**: "EXECUTE_SLOW_TASK" and "GENERATE LOG LINE" buttons also spawn async tasks
 
 ## Benefits
 
